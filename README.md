@@ -1,77 +1,107 @@
 # MegaHackAuto
 
-Small installer I made because every "free mega hack" download I found was either a
-repack with god knows what inside, or a Geode-only tutorial that didn't work on my setup.
+Installer for Mega Hack v9 on Windows. Downloads the genuine bundle from the
+vendor CDN, verifies the SHA-256 from the vendor manifest, patches the local
+license checks, installs it into Geometry Dash, and launches the game.
 
-This one doesn't contain Mega Hack. It's just a downloader + patcher. You run it, it pulls
-the real Mega Hack from absolllute's own CDN, patches the license check, drops it into your
-Geometry Dash folder and starts the game. The exe is ~19 KB because there's nothing in it.
-
-## Why it's like this
-
-I didn't want to upload a cracked DLL and ask people to trust a random file. So the repo is
-the actual source - you can read every line and compile it yourself. The only thing it does
-is HTTP requests, byte pattern matching, and file copies.
-
-If you don't trust the build in Releases, build it yourself. That's the point.
-
-## What it does
-
-- reads the vendor manifest at `absolllute.com/api/mega_hack/v9/install.json`
-- takes the newest standalone Windows bundle from it
-- downloads the zip and checks the SHA-256 against the manifest
-- patches three license checks inside `hackpro.dll` (all found by pattern, not offsets)
-- copies everything into the GD folder, backs up the old DLL as `.orig`
-- launches Geometry Dash
-- next time you run it, it checks the manifest again and updates itself if needed
-
-Patched spots, if you care:
-
-| what | found by | change |
-| --- | --- | --- |
-| signature check branch | `"signature invalid"` string + xref | 8 nops |
-| id / HWID compare | prologue `56 57 48 83 EC 48 48 83 79 10 40` | `mov eax,1; ret` |
-| login gate | `"data empty"` string + calls to the loader | 8 nops |
-
-No hardcoded addresses, so a Mega Hack update that keeps its strings still gets patched
-without me touching the code.
+Nothing is bundled in this repo — every run pulls the current build straight
+from `absolllute.com` and verifies it before touching it.
 
 ## Requirements
 
-- Geometry Dash 2.2091 (Steam, Windows)
-- close the game before running it
+- Windows, .NET Framework 4.x
+- Geometry Dash 2.2091 (Steam)
+- Geode v6 for the Geode build (`-geode` / `MegaHackAutoGeode.exe`)
+- Game closed before running
 
-## How to use
+## Usage
 
-1. download `MegaHackAuto.zip` from Releases
-2. close Geometry Dash
-3. run `MegaHackAuto.exe`
-4. wait for `Installed Mega Hack`
-5. game opens, press TAB
+| Command | What it does |
+|---|---|
+| `MegaHackAuto.exe` | installs the standalone `hackpro.dll` build |
+| `MegaHackAutoGeode.exe` | installs the Geode mod |
+| `MegaHackAuto.exe -geode` | installs the Geode build from the standalone binary |
+| `-standalone` | forces the standalone build from `MegaHackAutoGeode.exe` |
+| `-install-only` | install without launching the game |
+| `-strict` | abort instead of installing when no patch pattern matches |
+| `-dump` | extract + patch a copy to `.\mh-geode-dump`, install nothing |
+| `-check` | dry run: chosen bundles, hashes, URL status |
+| `-where` | list every GD install, Geode version, mods dir, megahack/node-ids state |
+| `-dir=PATH` | pin the game folder |
+| `-license=DIR` | pin the license stub folder |
 
-If Windows SmartScreen complains (it will, the exe is unsigned), More info then Run anyway.
+## Geode notes
 
-## Notes
+Geode v6 reads mods from `<GD>\geode\mods`; older versions read `<GD>\mods`.
+The tool detects the loader version from `geode/logs` and installs into the
+right folder, removing a stale copy from the old location if one exists.
 
-- it keeps a backup of your original DLL as `hackpro.dll.orig`
-- if you already have Mega Hack installed it just updates / re-patches it
-- it refuses to run while the game is open, so it doesn't half-copy files
-- no telemetry, no auto-start, no services, no drivers. read the code.
+Mega Hack declares hard dependencies (`geode.node-ids`, `absolllute.installer`)
+and Geode silently skips the mod when one is missing. The tool reads the
+dependencies out of the bundle's own `mod.json`, pulls anything missing from the
+Geode index, hash-verifies it, patches its DLLs the same way, and installs it.
+Mods already present are left alone.
+
+Dependency archives that .NET cannot unpack (node-ids ships LZMA) are installed
+untouched — they carry no license code to patch.
+
+A full game restart is required after installing — Geode only scans mods at
+boot.
+
+## Patches
+
+All patches are pattern based, never hardcoded addresses.
+
+| Target | Anchor | Replacement |
+|---|---|---|
+| ID/HWID compare | prologue `56 57 48 83 EC 48 48 83 79 10 40` | `mov eax,1; ret` |
+| Signature check | `"signature invalid"` + nearby `test al,al; jz` | 8 × `90` |
+| Login gate | `"data empty"` + nearby `test al,al; jz` | 8 × `90` |
+| Geode login state | cached login accessor prologue + fast path | `mov eax,1; ret` |
+
+The ID and login-state patches only apply when their signature appears exactly
+once in the binary, so a vendor update can never turn them into a blind patch of
+the wrong function. The two string-based branches are absent from current 9.2.0
+builds (they are kept for older versions) — the per-file report shows which
+anchors hit.
 
 ## Build
 
-```
+Two sources, one per target.
+
+```bat
+:: standalone
 csc /optimize+ /target:exe /out:MegaHackAuto.exe ^
-    /r:System.Web.Extensions.dll ^
-    /r:System.IO.Compression.dll ^
-    /r:System.IO.Compression.FileSystem.dll ^
-    /r:System.Net.Http.dll ^
-    MegaHackAuto.cs
+  /r:System.Web.Extensions.dll ^
+  /r:System.IO.Compression.dll ^
+  /r:System.IO.Compression.FileSystem.dll ^
+  /r:System.Net.Http.dll ^
+  MegaHackAuto.cs
+
+:: geode
+csc /optimize+ /target:exe /out:MegaHackAutoGeode.exe ^
+  /r:System.Web.Extensions.dll ^
+  /r:System.IO.Compression.dll ^
+  /r:System.IO.Compression.FileSystem.dll ^
+  /r:System.Net.Http.dll ^
+  MegaHackAutoGeode.cs
 ```
 
-.NET Framework 4.x, Windows.
+## Network use
 
-## Disclaimer
+Only two hosts are contacted:
 
-Educational use, patching software you're supposed to pay for is your own call and your own
-risk. I'm not the author of Mega Hack and this repo has no affiliation with absolllute.
+- `absolllute.com` — vendor manifest and bundle CDN
+- `api.geode-sdk.org` — node-ids dependency (only when it is missing)
+
+No telemetry, no auto-start, no services, no drivers, no registry writes.
+
+## Notes
+
+- A license stub is written to `%LOCALAPPDATA%\absolllute.megahack\license` if
+  no license file exists.
+- The previous install is kept as `*.orig` next to the new file.
+- The game is launched detached (`cmd /c start`), so closing the terminal that
+  ran the installer does not close Geometry Dash.
+- Unaffiliated with absolllute, Mega Hack, Geode, or RobTop. Patching paid
+  software is your own call.

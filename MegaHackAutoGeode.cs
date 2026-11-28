@@ -87,8 +87,8 @@ namespace MegaHackAuto
         private const string PackageName = "Mega Hack v9";
         // Bumped whenever the patch set changes, so an install made by an older
         // build of this tool is re-patched instead of reported as up to date.
-        private const string ToolRevision = "2";
-        private const string NodeIdsApi = "https://api.geode-sdk.org/v1/mods/geode.node-ids";
+        private const string ToolRevision = "3";
+        private const string ModApiBase = "https://api.geode-sdk.org/v1/mods/";
         private const string GeodeModFile = "absolllute.megahack.geode";
         private const string GeodeMarker = "absolllute.megahack.mhbuild";
         private const string StandaloneMarker = "hackpro.dll.mhbuild";
@@ -97,10 +97,26 @@ namespace MegaHackAuto
         private static readonly byte[] RetTrue = { 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3 };
         // Geode build: the cached "is logged in" accessor. Its prologue plus the
         // cached-byte fast path ("mov al,1; cmp byte [rcx],0; jne return") is unique.
+        // 9.2.1 changed the frame size; same shape, same single match.
         private static readonly byte[] LoginStatePrologue =
+        {
+            0x55, 0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8D, 0x6C, 0x24,
+            0x40, 0x48, 0xC7, 0x45, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0xB0, 0x01, 0x80, 0x39, 0x00, 0x0F, 0x85
+        };
+
+        // 9.2.0 and older: same accessor, larger stack frame.
+        private static readonly byte[] LoginStatePrologue920 =
         {
             0x55, 0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x78, 0x48, 0x8D, 0x6C, 0x24,
             0x70, 0x48, 0xC7, 0x45, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0xB0, 0x01, 0x80, 0x39, 0x00, 0x0F, 0x85
+        };
+
+        // Standalone 2.2091 build: the same predicate compiled small. The rel32
+        // operands are build specific, which is why a miss simply skips the patch.
+        private static readonly byte[] StandaloneLoginState =
+        {
+            0x56, 0x48, 0x83, 0xEC, 0x20, 0xE8, 0xA6, 0x29, 0x1B, 0x00, 0x48, 0x85, 0xC0, 0x74, 0x55, 0x48,
+            0x89, 0xC6, 0x48, 0x89, 0xC1, 0xE8, 0x56, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC1, 0xB0, 0x01, 0x80, 0x39
         };
 
         // Both branch anchors are matched inside this span of the anchor string.
@@ -337,9 +353,9 @@ namespace MegaHackAuto
             string dll = Path.Combine(extractDir, "hackpro.dll");
             if (!File.Exists(dll)) throw new InvalidDataException("hackpro.dll missing from bundle root");
 
-            PatchResult patches = PatchFile(dll, false);
+            PatchResult patches = PatchFile(dll, true);
             Console.WriteLine("Patched " + patches.Total + " pattern(s) in hackpro.dll (sig " + patches.Signature +
-                              ", id " + patches.Id + ", login " + patches.Login + ")");
+                              ", id " + patches.Id + ", login " + patches.Login + ", state " + patches.LoginState + ")");
             if (patches.Total == 0 && opt.Strict)
                 throw new InvalidDataException("license patterns not found in hackpro.dll");
 
@@ -424,7 +440,7 @@ namespace MegaHackAuto
             // Repack preserves the bundle's internal layout (mod.json at root,
             // per-platform subfolders if the vendor ships a universal build).
             RepackZip(extractDir, target);
-            EnsureNodeIds(http, gameDir, gdVersion);
+            EnsureDependencies(http, gameDir, gdVersion, extractDir);
             EnsureLicense(opt);
             File.WriteAllText(marker, expectedMarker);
 
@@ -452,47 +468,80 @@ namespace MegaHackAuto
             Console.WriteLine("Fully restart Geometry Dash so Geode re-scans the mods folder.");
         }
 
-        // Mega Hack v9 declares geode.node-ids as a hard dependency; Geode silently
-        // skips the mod when it is missing. Pull the newest accepted Windows build
-        // from the Geode index and verify its hash before dropping it in mods\.
-        private static void EnsureNodeIds(HttpClient http, string gameDir, string gdVersion)
+        // Mega Hack declares hard dependencies (geode.node-ids, absolllute.installer);
+        // Geode silently skips a mod when one is missing. Read them out of the
+        // bundle's own mod.json, pull what is missing from the Geode index, verify
+        // the hash, patch the dependency's DLLs the same way, and install it.
+        private static void EnsureDependencies(HttpClient http, string gameDir, string gdVersion, string extractDir)
+        {
+            Dictionary<string, object> meta;
+            try
+            {
+                string metaPath = Path.Combine(extractDir, "mod.json");
+                if (!File.Exists(metaPath)) return;
+                meta = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(metaPath));
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("[warn] dependency check skipped: " + ex.Message);
+                return;
+            }
+
+            object depsObj;
+            if (!meta.TryGetValue("dependencies", out depsObj)) return;
+            var deps = depsObj as Dictionary<string, object>;
+            if (deps == null) return;
+
+            foreach (var pair in deps)
+            {
+                string id = pair.Key;
+                if (id == "geode.loader") continue;
+
+                if (ModsHaveId(gameDir, id))
+                {
+                    Console.WriteLine(id + ": present");
+                    continue;
+                }
+
+                InstallDependency(http, gameDir, gdVersion, id, Convert.ToString(pair.Value));
+            }
+        }
+
+        private static void InstallDependency(HttpClient http, string gameDir, string gdVersion, string id, string requirement)
         {
             try
             {
-                if (ModsHaveId(gameDir, "geode.node-ids"))
-                {
-                    Console.WriteLine("node-ids: present");
-                    return;
-                }
-
-                Console.WriteLine("node-ids: missing, installing from the Geode index");
-                string json = http.GetStringAsync(NodeIdsApi).Result;
+                Console.WriteLine(id + ": missing, installing from the Geode index");
+                string json = http.GetStringAsync(ModApiBase + Uri.EscapeDataString(id)).Result;
                 var root = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
                 var payload = (Dictionary<string, object>)root["payload"];
 
-                Dictionary<string, object> exact = null;
-                Dictionary<string, object> any = null;
+                string minimum = MinimumVersion(requirement);
+                Dictionary<string, object> exactGd = null;
+                Dictionary<string, object> anyGd = null;
+
                 foreach (var item in AsList(payload["versions"]))
                 {
                     var version = (Dictionary<string, object>)item;
                     if (Convert.ToString(version["status"]) != "accepted") continue;
+                    if (!SatisfiesMinimum(Convert.ToString(version["version"]), minimum)) continue;
 
                     var gd = version["gd"] as Dictionary<string, object>;
                     string winVersion = gd != null && gd.ContainsKey("win") ? Convert.ToString(gd["win"]) : null;
                     if (string.IsNullOrEmpty(winVersion)) continue;
 
-                    if (any == null) any = version;
+                    if (anyGd == null) anyGd = version;
                     if (!string.IsNullOrEmpty(gdVersion) && winVersion == gdVersion)
                     {
-                        exact = version;
+                        exactGd = version;
                         break;
                     }
                 }
 
-                var chosen = exact ?? any;
+                var chosen = exactGd ?? anyGd;
                 if (chosen == null)
                 {
-                    Console.WriteLine("[warn] node-ids: no compatible Windows build on the index");
+                    Console.WriteLine("[warn] " + id + ": no compatible Windows build on the index");
                     return;
                 }
 
@@ -500,7 +549,7 @@ namespace MegaHackAuto
                 string hash = Convert.ToString(chosen["hash"]);
                 string link = Convert.ToString(chosen["download_link"]);
 
-                string temp = Path.Combine(Path.GetTempPath(), "mhauto-nodeids-" + Guid.NewGuid().ToString("N") + ".geode");
+                string temp = Path.Combine(Path.GetTempPath(), "mhauto-dep-" + Guid.NewGuid().ToString("N") + ".geode");
                 using (var stream = http.GetStreamAsync(link).Result)
                 using (var file = File.Create(temp))
                     stream.CopyTo(file);
@@ -509,20 +558,114 @@ namespace MegaHackAuto
                 if (!string.Equals(actual, hash, StringComparison.OrdinalIgnoreCase))
                 {
                     try { File.Delete(temp); } catch { }
-                    throw new InvalidDataException("node-ids hash mismatch: " + actual);
+                    throw new InvalidDataException(id + " hash mismatch: " + actual);
                 }
 
                 string mods = GetModsDir(gameDir);
                 Directory.CreateDirectory(mods);
-                File.Copy(temp, Path.Combine(mods, "geode.node-ids.geode"), true);
-                try { File.Delete(temp); } catch { }
+                string target = Path.Combine(mods, id + ".geode");
 
-                Console.WriteLine("node-ids: installed " + versionName);
+                // Some index mods use a compression method .NET Framework cannot
+                // unpack (node-ids ships LZMA). Those need no patching, so the
+                // verified file goes in untouched instead of failing the install.
+                try
+                {
+                    string workDir = Path.Combine(Path.GetTempPath(), "mhauto-dep-" + Guid.NewGuid().ToString("N"));
+                    string tempExtract = Path.Combine(workDir, "x");
+                    Directory.CreateDirectory(workDir);
+                    ZipFile.ExtractToDirectory(temp, tempExtract);
+
+                    int patches = 0;
+                    foreach (var dll in Directory.GetFiles(tempExtract, "*.dll", SearchOption.AllDirectories))
+                    {
+                        PatchResult r = PatchFile(dll, true);
+                        patches += r.Total;
+                        Console.WriteLine("  " + Path.GetFileName(dll) + " — sig " + r.Signature + ", id " + r.Id +
+                                          ", login " + r.Login + ", state " + r.LoginState);
+                    }
+
+                    RepackZip(tempExtract, target);
+                    TryDelete(workDir);
+                    Console.WriteLine(id + ": installed " + versionName + " (" + patches + " patch(es))");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[warn] " + id + ": archive not unpackable (" + ex.Message +
+                                      "), installing the verified file unpatched");
+                    File.Copy(temp, target, true);
+                    Console.WriteLine(id + ": installed " + versionName);
+                }
+
+                try { File.Delete(temp); } catch { }
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[warn] node-ids install failed: " + ex.Message);
+                Console.WriteLine("[warn] " + id + " install failed: " + ex.Message);
             }
+        }
+
+        private static string MinimumVersion(string requirement)
+        {
+            if (string.IsNullOrEmpty(requirement)) return null;
+            string value = requirement.Trim();
+            string[] prefixes = { ">=", ">", "==", "=", "~", "^" };
+            foreach (var prefix in prefixes)
+            {
+                if (value.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    value = value.Substring(prefix.Length).Trim();
+                    break;
+                }
+            }
+            return value.TrimStart('v', 'V');
+        }
+
+        private static bool SatisfiesMinimum(string version, string minimum)
+        {
+            if (string.IsNullOrEmpty(minimum)) return true;
+            return CompareVersions(version, minimum) >= 0;
+        }
+
+        private static int CompareVersions(string a, string b)
+        {
+            int[] pa = ParseVersion(a);
+            int[] pb = ParseVersion(b);
+            for (int i = 0; i < 3; i++)
+                if (pa[i] != pb[i]) return pa[i] < pb[i] ? -1 : 1;
+
+            bool preA = HasPrerelease(a);
+            bool preB = HasPrerelease(b);
+            if (preA != preB) return preA ? -1 : 1;
+            if (!preA) return 0;
+            return string.Compare(Prerelease(a), Prerelease(b), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static int[] ParseVersion(string version)
+        {
+            var result = new int[3];
+            string core = (version ?? string.Empty).TrimStart('v', 'V');
+            int dash = core.IndexOf('-');
+            if (dash >= 0) core = core.Substring(0, dash);
+
+            string[] parts = core.Split('.');
+            for (int i = 0; i < 3 && i < parts.Length; i++)
+            {
+                int value;
+                int.TryParse(parts[i], out value);
+                result[i] = value;
+            }
+            return result;
+        }
+
+        private static bool HasPrerelease(string version)
+        {
+            return (version ?? string.Empty).IndexOf('-') >= 0;
+        }
+
+        private static string Prerelease(string version)
+        {
+            int dash = (version ?? string.Empty).IndexOf('-');
+            return dash < 0 ? string.Empty : version.Substring(dash + 1);
         }
 
         // .NET Framework's ZipFile.CreateFromDirectory writes entry names with
@@ -575,19 +718,25 @@ namespace MegaHackAuto
         // never turn this into a blind patch of the wrong function.
         private static int PatchLoginState(byte[] data)
         {
-            int found = -1;
-            int count = 0;
-            for (int i = 0; i <= data.Length - LoginStatePrologue.Length; i++)
+            byte[][] signatures = { LoginStatePrologue, LoginStatePrologue920, StandaloneLoginState };
+            foreach (var signature in signatures)
             {
-                if (data[i] != LoginStatePrologue[0]) continue;
-                if (!MatchesAt(data, i, LoginStatePrologue)) continue;
-                found = i;
-                count++;
+                int found = -1;
+                int count = 0;
+                for (int i = 0; i <= data.Length - signature.Length; i++)
+                {
+                    if (data[i] != signature[0]) continue;
+                    if (!MatchesAt(data, i, signature)) continue;
+                    found = i;
+                    count++;
+                }
+
+                if (count != 1) continue;
+                Array.Copy(RetTrue, 0, data, found, RetTrue.Length);
+                return 1;
             }
 
-            if (count != 1) return 0;
-            Array.Copy(RetTrue, 0, data, found, RetTrue.Length);
-            return 1;
+            return 0;
         }
 
         // The 11-byte ID/HWID prologue must occur exactly once; a second match in
